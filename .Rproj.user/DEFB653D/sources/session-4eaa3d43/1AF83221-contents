@@ -1,0 +1,299 @@
+---
+title: "Nanaimo Lakes limnology Dashboard 2022-23 Data"
+theme:
+            version: 4
+            bootswatch: minty
+output: 
+  flexdashboard::flex_dashboard:
+  orientation: rows
+vertical_layout: fill
+self_contained: false
+
+---
+
+```{r setup, include=FALSE}
+library(ggplot2)
+library(dplyr)
+library(scales)
+library(akima)
+library(plotly)
+library(tidyr)
+library(htmlwidgets)
+```
+
+# Temp {data-orientation="Column"}
+
+## row {data-width=550}
+
+### Interpolated Temperature Profile of First Lake
+
+```{r}
+
+FirstLake <- read.csv("https://raw.githubusercontent.com/GSTsalmon/NanaimoLakesData/refs/heads/main/FirstLake2022-2023.csv")
+FirstLake$Time <- as.POSIXct(FirstLake$Time, format = "%m/%d/%Y %H:%M")
+FirstLake$Date <- as.Date(FirstLake$Time)
+
+FirstLake <- FirstLake %>%
+  filter(!is.na(Temperature), !is.na(Depth), !is.na(pH), Depth >= 0) %>%
+  mutate(
+    Depth       = round(Depth, 2),
+    Temperature = round(Temperature, 2),
+    pH=round(pH,2),
+    DO=round(DO.Mg.L,2))
+
+SecondLake <- read.csv(
+  "https://raw.githubusercontent.com/GSTsalmon/NanaimoLakesData/refs/heads/main/SecondLake2022-2023.csv"
+)
+SecondLake$Time <- as.POSIXct(SecondLake$Time, format = "%m/%d/%Y %H:%M")
+SecondLake$Date <- as.Date(SecondLake$Time)
+
+SecondLake <- SecondLake %>%
+  filter(!is.na(Temperature), !is.na(Depth), !is.na(pH), Depth >= 0) %>%
+  mutate(
+    Depth       = round(Depth, 2),
+    Temperature = round(Temperature, 2),
+    pH=round(pH,2),
+    DO=round(DO..mg.L.,2))
+#-----------------------------------
+
+
+# 1. helper: subsample at 20 cm (nearest‐neighbor)
+sample_by_depth_interval <- function(df, interval = 0.2) {
+  df %>%
+    group_by(Date) %>%
+    do({
+      depths  <- .$Depth
+      targets <- seq(min(depths), max(depths), by = interval)
+      nearest <- sapply(targets, function(t) depths[which.min(abs(depths - t))])
+      filter(., Depth %in% unique(nearest))
+    }) %>%
+    ungroup()
+}
+
+# 2. helper: read→clean→subsample→aggregate→interpolate
+make_interp_df <- function(csv_url) {
+  df <- read.csv(csv_url) %>%
+    mutate(
+      Time        = as.POSIXct(Time, format = "%m/%d/%Y %H:%M"),
+      Date        = as.Date(Time),
+      Depth       = round(Depth,   2),
+      Temperature = round(Temperature, 2)
+    ) %>%
+    filter(!is.na(Temperature), Depth >= 0)
+
+  # 2a. subsample at 20 cm
+  df_samp <- sample_by_depth_interval(df, interval = 0.2)
+
+  # 2b. daily‐mean
+  interp_input <- df_samp %>%
+    group_by(Date, Depth) %>%
+    summarise(Temperature = mean(Temperature), .groups = "drop")
+
+  # 2c. interpolation grid
+  x_num   <- as.numeric(interp_input$Date)
+  x_rng   <- range(x_num)
+  y_rng   <- range(interp_input$Depth)
+  ir <- with(interp_input, interp(
+    x         = x_num,
+    y         = Depth,
+    z         = Temperature,
+    xo        = seq(x_rng[1], x_rng[2], length = 100),
+    yo        = seq(y_rng[1], y_rng[2], length = 50),
+    duplicate = "mean",
+    linear    = TRUE,
+    extrap    = TRUE
+  ))
+
+  # 2d. tidy result
+  expand.grid(
+    Date  = as.Date(ir$x, origin = "1970-01-01"),
+    Depth = round(ir$y, 3)
+  ) %>%
+    mutate(Temperature = round(as.vector(ir$z), 3))
+}
+
+# 3. create interpolated data for both lakes
+df1 <- make_interp_df(
+  "https://raw.githubusercontent.com/GSTsalmon/NanaimoLakesData/refs/heads/main/FirstLake2022-2023.csv"
+)
+df2 <- make_interp_df(
+  "https://raw.githubusercontent.com/GSTsalmon/NanaimoLakesData/refs/heads/main/SecondLake2022-2023.csv"
+)
+
+# 4. compute shared fill limits & contour breaks
+all_temps      <- c(df1$Temperature, df2$Temperature)
+fill_limits    <- range(all_temps, na.rm = TRUE)
+fill_mid       <- mean(fill_limits)
+contour_breaks <- seq(floor(fill_limits[1]), ceiling(fill_limits[2]), by = 5)
+
+# 5. plotting function (expects interpolated df)
+make_temp_plot <- function(interp_df, lake_name) {
+  x_dates  <- sort(unique(interp_df$Date))
+  tile_w   <- as.numeric(diff(x_dates)[1])
+  y_depths <- sort(unique(interp_df$Depth))
+  tile_h   <- diff(y_depths)[1]
+  max_depth<- max(y_depths)
+
+  ggplot(interp_df, aes(Date, Depth, fill = Temperature)) +
+    geom_tile(width = tile_w, height = tile_h) +
+    geom_contour(aes(z = Temperature),
+                 breaks = contour_breaks,
+                 color  = "black", size = 0.4, alpha = 0.6) +
+    scale_x_date(expand = c(0, 0),
+                 date_breaks = "1 month",
+                 date_labels = "%b %Y") +
+    scale_y_reverse(expand = c(0,0),
+                    limits = c(max_depth, 0)) +
+    scale_fill_gradient2(
+      low      = "blue",
+      mid      = "white",
+      high     = "red",
+      midpoint = fill_mid,
+      limits   = fill_limits,
+      name     = "Temp (°C)"
+    ) +
+    labs(title = lake_name, x = NULL, y = "Depth (m)") +
+    theme_minimal() +
+    theme(panel.grid   = element_blank(),
+          panel.border = element_rect(color = "black", fill = NA),
+          plot.title   = element_text(hjust = 0.5))
+}
+
+# 6. build & render
+p1 <- make_temp_plot(df1, "")
+ggplotly(p1)
+
+
+```
+row {data-width=550}
+-----------------------------------------------------------------------
+### Interpolated Temperature Profile of Second Lake
+
+```{r}
+p2 <- make_temp_plot(df2, "")
+ggplotly(p2)
+```
+
+# pH {data-orientation="Column"}
+
+## row {data-width=550}
+-----------------------------------------------------------------------
+### pH Profile of First Lake
+```{r}
+pretty_samplesFirstLake <- FirstLake %>%
+  group_by(Date) %>%
+  filter(Depth %in% sample(unique(Depth), size = min(30, length(unique(Depth))), replace = FALSE)) %>%
+  ungroup()
+
+
+
+# Basic pH profile plot
+phFirstLake<- ggplot(pretty_samplesFirstLake, aes(x = pH, y = Depth)) +
+  geom_point(color = "darkred", size = 2, alpha=0.4) +
+  scale_y_reverse() +  # Depth increases downward
+  facet_wrap(~ Date, ncol = 4) +
+  labs(
+    title = "",
+    x = "",
+    y = "Depth (m)"
+  ) +
+  theme_minimal()
+
+
+ggplotly(phFirstLake)
+
+```
+
+
+row {data-width=550}
+-----------------------------------------------------------------------
+### pH Profile of Second Lake
+```{r}
+pretty_samples2ndLake <- SecondLake %>%
+  group_by(Date) %>%
+  filter(Depth %in% sample(unique(Depth), size = min(30, length(unique(Depth))), replace = FALSE)) %>%
+  ungroup()
+
+
+
+# Basic pH profile plot
+ph2ndLake<- ggplot(pretty_samples2ndLake, aes(x = pH, y = Depth)) +
+  geom_point(color = "darkred", size = 2, alpha=0.4) +
+  scale_y_reverse() +  # Depth increases downward
+  facet_wrap(~ Date, ncol = 4) +
+  labs(
+    title = "",
+    x = "",
+    y = "Depth (m)"
+  ) +
+  theme_minimal()
+
+
+ggplotly(phFirstLake)
+
+```
+
+
+
+
+
+
+# DO {data-orientation="Column"}
+
+## row {data-width=550}
+-----------------------------------------------------------------------
+
+### DO profile of First Lake
+
+```{r}
+pretty_samplesDOFirstlake <- FirstLake %>%
+  group_by(Date) %>%
+  filter(DO %in% sample(unique(DO), size = min(30, length(unique(DO ))), replace = FALSE)) %>%
+  ungroup()
+
+
+DOPlotFirstlake<- ggplot(pretty_samplesDOFirstlake, aes(x = DO , y = Depth)) +
+ # geom_path(color = "steelblue", linewidth = 1) +
+  geom_point(color = "darkred", size = 2, alpha=0.4) +
+  scale_y_reverse() +  
+  facet_wrap(~ Date, ncol = 4) +
+  labs(
+    title = "",
+    x = "",
+    y = "Depth (m)"
+  ) +
+  theme_minimal()
+
+
+ ggplotly(DOPlotFirstlake)
+
+``` 
+ 
+ ## row {data-width=550}
+-----------------------------------------------------------------------
+
+### DO profile of Second Lake
+```{r}
+pretty_samplesDO <- SecondLake %>%
+  group_by(Date) %>%
+  filter(DO %in% sample(unique(DO), size = min(30, length(unique(DO ))), replace = FALSE)) %>%
+  ungroup()
+
+
+DOPlotSecondLake<- ggplot(pretty_samplesDO, aes(x = DO , y = Depth)) +
+  geom_point(color = "darkred", size = 2, alpha=0.4) +
+  scale_y_reverse() +  
+  facet_wrap(~ Date, ncol = 4) +
+  labs(
+    title = "",
+    x = "",
+    y = "Depth (m)"
+  ) +
+  theme_minimal()
+
+
+ ggplotly(DOPlotSecondLake)
+```
+
+ 
+ 
